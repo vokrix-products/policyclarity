@@ -1,164 +1,139 @@
-"""PolicyClarity poller worker for Railway.
+import os, sys, json, time, traceback, requests
+from datetime import datetime, timezone
 
-Each cycle:
-    1. asks Supabase for rows in SOURCE_TABLE that are not processed yet
-    2. downloads the referenced file from Supabase Storage
-    3. runs process_file() over the raw bytes
-    4. inserts normalized records into TARGET_TABLE
-    5. flags the source row as processed (recording errors)
-"""
+SUPABASE_URL = os.environ.get('SUPABASE_URL')
+SUPABASE_SERVICE_KEY = os.environ.get('SUPABASE_SERVICE_KEY')
+PRODUCT_ID = os.environ.get('PRODUCT_ID')
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
-from __future__ import annotations
+if not SUPABASE_URL or not SUPABASE_SERVICE_KEY or not PRODUCT_ID:
+    raise RuntimeError('Missing required env vars: SUPABASE_URL, SUPABASE_SERVICE_KEY, PRODUCT_ID')
 
-import os
-import signal
-import time
-import traceback
-from typing import Any, Dict, List, Optional
+REST_URL = f"{SUPABASE_URL}/rest/v1"
+SB_HEADERS = {
+    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+    "apikey": SUPABASE_SERVICE_KEY,
+    "Content-Type": "application/json",
+}
 
-import requests
+def download_file(bucket, file_path):
+    if file_path.startswith(bucket + "/"):
+        file_path = file_path[len(bucket) + 1:]
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{file_path}"
+    resp = requests.get(url, headers={"Authorization": f"Bearer {SUPABASE_SERVICE_KEY}", "apikey": SUPABASE_SERVICE_KEY})
+    resp.raise_for_status()
+    return resp.content
 
-from processor import process_file
+def upload_file(bucket, file_path, content):
+    if file_path.startswith(bucket + "/"):
+        file_path = file_path[len(bucket) + 1:]
+    url = f"{SUPABASE_URL}/storage/v1/object/{bucket}/{file_path}"
+    resp = requests.post(url, headers={
+        "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
+        "apikey": SUPABASE_SERVICE_KEY,
+        "Content-Type": "application/octet-stream",
+        "x-upsert": "true",
+    }, data=content)
+    resp.raise_for_status()
+    return resp
 
-_STOP = False
-
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
-    value = os.environ.get(name)
-    if value is None or not value.strip():
-        return default
-    return value.strip()
-
-
-SUPABASE_URL = (_env("SUPABASE_URL") or "").rstrip("/")
-SUPABASE_KEY = _env("SUPABASE_KEY") or _env("SUPABASE_SERVICE_KEY") or ""
-SOURCE_TABLE = _env("SOURCE_TABLE", "documents")
-TARGET_TABLE = _env("TARGET_TABLE", "policy_records")
-STORAGE_BUCKET = _env("STORAGE_BUCKET", "policies")
-POLL_INTERVAL = float(_env("POLL_INTERVAL", "60") or "60")
-BATCH_SIZE = int(_env("BATCH_SIZE", "10") or "10")
-
-
-def _log(message: str) -> None:
-    print("[policyclarity] %s" % message, flush=True)
-
-
-def _headers(extra=None):
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": "Bearer %s" % SUPABASE_KEY,
-        "Content-Type": "application/json",
+def insert_notification(customer_id, title, body, notification_type):
+    url = f"{REST_URL}/notifications"
+    payload = {
+        "product_id": PRODUCT_ID,
+        "customer_id": customer_id,
+        "title": title,
+        "body": body,
+        "type": notification_type,
+        "read": False,
     }
-    if extra:
-        headers.update(extra)
-    return headers
+    resp = requests.post(url, headers=SB_HEADERS, json=payload)
+    resp.raise_for_status()
 
+def update_job(job_id, payload):
+    url = f"{REST_URL}/jobs?id=eq.{job_id}"
+    headers = {**SB_HEADERS, "Prefer": "return=minimal"}
+    resp = requests.patch(url, headers=headers, json=payload)
+    resp.raise_for_status()
 
-def _table_url(table: str) -> str:
-    return "%s/rest/v1/%s" % (SUPABASE_URL, table)
-
-
-def _fetch_pending():
-    params = {
-        "processed": "eq.false",
-        "select": "*",
-        "limit": str(BATCH_SIZE),
-        "order": "created_at.asc",
-    }
-    response = requests.get(
-        _table_url(SOURCE_TABLE), headers=_headers(), params=params, timeout=30
-    )
-    response.raise_for_status()
-    rows = response.json()
-    return rows if isinstance(rows, list) else []
-
-
-def _download_file(row):
-    path = (
-        row.get("storage_path")
-        or row.get("file_path")
-        or row.get("path")
-        or row.get("filename")
-    )
-    if not path:
-        return None
-    url = "%s/storage/v1/object/%s/%s" % (
-        SUPABASE_URL,
-        STORAGE_BUCKET,
-        str(path).lstrip("/"),
-    )
-    response = requests.get(url, headers=_headers(), timeout=60)
-    response.raise_for_status()
-    return response.content
-
-
-def _insert_records(records, row):
-    if not records:
-        return 0
-    payload = []
-    for record in records:
-        payload.append(
-            {
-                "source_id": row.get("id"),
-                "source_path": row.get("storage_path")
-                or row.get("file_path")
-                or row.get("path"),
-                "title": record.get("title"),
-                "status": record.get("status"),
-                "details": record.get("details") or {},
-                "due_date": record.get("due_date"),
-            }
-        )
-    response = requests.post(
-        _table_url(TARGET_TABLE),
-        headers=_headers({"Prefer": "return=minimal"}),
-        json=payload,
-        timeout=30,
-    )
-    response.raise_for_status()
-    return len(payload)
-
-
-def _mark_processed(row, error=None):
-    body = {"processed": True, "error": error}
-    response = requests.patch(
-        _table_url(SOURCE_TABLE),
-        headers=_headers({"Prefer": "return=minimal"}),
-        params={"id": "eq.%s" % row.get("id")},
-        json=body,
-        timeout=30,
-    )
-    response.raise_for_status()
-
-
-def run_once() -> int:
-    if not SUPABASE_URL or not SUPABASE_KEY:
-        _log("SUPABASE_URL and SUPABASE_KEY are required")
-        return 0
-    try:
-        rows = _fetch_pending()
-    except Exception as exc:
-        _log("fetch failed: %s" % exc)
-        return 0
-    if not rows:
-        return 0
-
-    written = 0
-    for row in rows:
+def poll():
+    print("Poller started", flush=True)
+    import processor
+    while True:
         try:
-            data = _download_file(row)
-            if not data:
-                _mark_processed(row, "no file found for row")
+            url = f"{REST_URL}/jobs?status=eq.pending&job_type=eq.process_upload&product_id=eq.{PRODUCT_ID}&order=created_at.asc&limit=1"
+            resp = requests.get(url, headers=SB_HEADERS)
+            resp.raise_for_status()
+            jobs = resp.json()
+            if not jobs:
+                time.sleep(60)
                 continue
-            records = process_file(data)
-            written += _insert_records(records, row)
-            _mark_processed(row, None)
-            _log("row %s -> %d records" % (row.get("id"), len(records)))
-        except Exception as exc:
-            _log("row %s failed: %s" % (row.get("id"), exc))
-            traceback.print_exc()
+            job = jobs[0]
+            job_id = job.get('id')
+            customer_id = job.get('customer_id')
+            input_file_path = job.get('input_file_path')
+            print(f"Processing job {job_id} for customer {customer_id}", flush=True)
             try:
-                _mark_processed(row, str(exc)[:500])
-            except Exception:
-                pass
-    return written
+                file_bytes = download_file('uploads', input_file_path)
+                results = processor.process_file(file_bytes)
+                if not isinstance(results, list):
+                    results = [results]
+                for r in results:
+                    record = {
+                        "product_id": PRODUCT_ID,
+                        "customer_id": customer_id,
+                        "title": r["title"],
+                        "status": r["status"],
+                        "details": r["details"],
+                        "source_file_path": input_file_path,
+                        "due_date": r.get("due_date"),
+                    }
+                    rec_resp = requests.post(
+                        f"{REST_URL}/records",
+                        headers={**SB_HEADERS, "Prefer": "return=minimal"},
+                        json=record,
+                    )
+                    rec_resp.raise_for_status()
+                output_file_path = f"results/{PRODUCT_ID}/{job_id}.json"
+                upload_file('results', output_file_path, json.dumps(results).encode('utf-8'))
+                summary = f"Extracted {len(results)} records"
+                update_job(job_id, {
+                    "status": "completed",
+                    "output_file_path": output_file_path,
+                    "result_summary": summary,
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                })
+                try:
+                    insert_notification(
+                        customer_id,
+                        "Processing complete",
+                        "Your upload has been processed successfully.",
+                        "success",
+                    )
+                except Exception:
+                    traceback.print_exc()
+            except Exception as e:
+                traceback.print_exc()
+                error_summary = str(e)[:1000]
+                try:
+                    update_job(job_id, {
+                        "status": "failed",
+                        "result_summary": error_summary,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                    })
+                    insert_notification(
+                        customer_id,
+                        "Processing failed",
+                        "There was an error processing your upload.",
+                        "error",
+                    )
+                except Exception as inner:
+                    traceback.print_exc()
+            time.sleep(60)
+        except Exception as e:
+            traceback.print_exc()
+            time.sleep(60)
+
+if __name__ == "__main__":
+    print("Poller started")
+    poll()
