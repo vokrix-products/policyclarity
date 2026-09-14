@@ -3,6 +3,39 @@ import { supabase, PRODUCT_ID } from '@/lib/supabase'
 import { useAuthStore } from '@/stores/auth-store'
 import { type Task } from './schema'
 
+/**
+ * records.details is jsonb and holds two shapes in the wild:
+ *   - an object, written by the poller and by manual edits
+ *   - a plain human-readable sentence, written by older processor.py versions
+ *
+ * taskSchema declares it as a record, so a string fails validation and the
+ * row throws during render (the policies tab 500s). Normalise it here, at the
+ * fetch boundary, so every consumer downstream sees exactly one shape.
+ */
+function normalizeDetails(value: unknown): Record<string, unknown> | null {
+  if (value === null || value === undefined) return null
+
+  if (typeof value === 'object' && !Array.isArray(value)) {
+    return value as Record<string, unknown>
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return null
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      // Not JSON - legacy prose. Wrapped as a summary below.
+    }
+    return { summary: trimmed }
+  }
+
+  return { summary: String(value) }
+}
+
 async function writeAudit(action: string, entity: string, entityId: string, userId: string) {
   try {
     await supabase.from('audit_log').insert({
@@ -32,7 +65,7 @@ async function fetchTasks(): Promise<Task[]> {
     status: row.status,
     label: row.label ?? '',
     priority: row.priority ?? '',
-    details: row.details ?? null,
+    details: normalizeDetails(row.details),
     source_file_path: row.source_file_path ?? null,
     due_date: row.due_date ?? null,
   }))

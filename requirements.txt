@@ -2,3 +2,4 @@ pypdf
 openpyxl
 xlrd
 requests
+openai

@@ -20,7 +20,11 @@ type DataTableRowActionsProps<TData> = {
 export function DataTableRowActions<TData>({
   row,
 }: DataTableRowActionsProps<TData>) {
-  const task = taskSchema.parse(row.original)
+  // safeParse, not parse: this runs once per row during render, so a single
+  // unexpected row shape used to throw and take down the whole route.
+  const parsed = taskSchema.safeParse(row.original)
+  if (!parsed.success) return null
+  const task = parsed.data
 
   const { setOpen, setCurrentRow } = useTasks()
 
