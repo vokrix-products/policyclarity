@@ -67,6 +67,30 @@ DATE_FORMATS = [
     "%m-%d-%Y", "%m.%d.%Y", "%Y.%m.%d",
 ]
 
+# The statuses the dashboard renders (badge colour + status filter option).
+# Longest-first so that "PENDING RENEWAL QUOTE" is preferred over "PENDING".
+CANONICAL_STATUSES = (
+    "EXPIRING SOON",
+    "PENDING RENEWAL QUOTE",
+    "PENDING VERIFICATION",
+    "EXPIRED",
+    "PENDING",
+    "VALID",
+    "ACTIVE",
+)
+
+# Fields lifted into the structured details object, in display order.
+DETAIL_LABELS = (
+    ("insurer", "Insurer"),
+    ("insured", "Insured"),
+    ("policy_number", "Policy #"),
+    ("coverage_type", "Coverage"),
+    ("effective_date", "Effective"),
+    ("expiration_date", "Expiration"),
+    ("limits", "Limits"),
+    ("premium", "Premium"),
+)
+
 
 def _decode_bytes(file_bytes):
     for enc in ("utf-8-sig", "utf-8", "latin-1"):
@@ -161,9 +185,10 @@ def _extract_raw_text(file_bytes):
         text = _extract_xls_text(file_bytes)
         if text:
             return text
-    text = _extract_pdf_text(file_bytes)
-    if text:
-        return text
+    # Last-resort fallback for bytes whose magic number we did not recognise.
+    # pypdf is deliberately NOT retried here: on non-PDF bytes it logs
+    # "invalid pdf header" and "EOF marker not found" to stderr on every
+    # upload, which is what filled the poller logs.
     text = _extract_xlsx_text(file_bytes)
     if text:
         return text
@@ -225,13 +250,32 @@ def _is_delimited(text):
 def _synth_status(expiration_iso):
     d = _parse_date(expiration_iso)
     if d is None:
-        return "active"
+        return "ACTIVE"
     today = datetime.now(timezone.utc).date()
     if d < today:
-        return "expired"
+        return "EXPIRED"
     if d <= today + timedelta(days=30):
-        return "expiring"
-    return "active"
+        return "EXPIRING SOON"
+    return "VALID"
+
+
+def _canonical_status(raw_status, expiration_iso):
+    """Clamp a free-form status onto the set the dashboard can render.
+
+    The model returns sentences such as "EXPIRED - RENEWAL PENDING UNDERWRITING
+    REVIEW", which map to no badge colour and no filter option. Keep the
+    leading token when it is one we know, else fall back to the due date.
+    """
+    text = str(raw_status or "").strip().upper()
+    text = text.replace("\u2014", "-").replace("\u2013", "-")
+    text = re.sub(r"\s+", " ", text).strip()
+    if text.endswith("."):
+        text = text[:-1].strip()
+    for status in CANONICAL_STATUSES:
+        if text == status or text.startswith(status + " ") or \
+                text.startswith(status + "-"):
+            return status
+    return _synth_status(expiration_iso)
 
 
 def _norm_key(key):
@@ -280,27 +324,13 @@ def _row_to_record(row):
     due_date = _iso(extras.get("expiration_date", ""))
     status = out.get("status") or _synth_status(due_date)
 
-    bits = []
-    labels = (("Insurer", "insurer"), ("Insured", "insured"),
-              ("Policy #", "policy_number"), ("Coverage", "coverage_type"),
-              ("Effective", "effective_date"), ("Expiration", "expiration_date"),
-              ("Limits", "limits"), ("Premium", "premium"))
-    for label, key in labels:
-        if extras.get(key):
-            bits.append("%s: %s" % (label, extras[key]))
-
-    details = out.get("details") or ""
-    joined = "; ".join(bits)
-    if details and joined:
-        details = "%s; %s" % (details, joined)
-    elif joined:
-        details = joined
-
+    # Only the raw notes column rides along as prose. The individual fields are
+    # assembled into the structured details object by _normalize_record.
     rec = dict(extras)
     rec.update({
         "title": title.strip(),
         "status": status.strip(),
-        "details": details.strip() or "No additional details extracted.",
+        "details": (out.get("details") or "").strip(),
         "due_date": due_date,
     })
     return rec
@@ -388,7 +418,9 @@ DEEPSEEK_SYSTEM = (
     "\"insurer\": str, \"insured\": str, \"coverage_type\": str, "
     "\"effective_date\": str, \"expiration_date\": str, \"limits\": str, "
     "\"premium\": str} ]}. due_date must be an ISO date (YYYY-MM-DD) or "
-    "empty string. title must be non-empty. Output JSON only."
+    "empty string. title must be non-empty. status must be one of "
+    "VALID, ACTIVE, EXPIRING SOON, PENDING, PENDING VERIFICATION, "
+    "PENDING RENEWAL QUOTE, EXPIRED. Output JSON only."
 )
 
 
@@ -431,8 +463,48 @@ def _deepseek_extract(raw_text):
     for rec in records:
         if not isinstance(rec, dict):
             continue
-        out.append(_normalize_record(rec))
+        # Left un-normalised on purpose: process_file normalises every record
+        # exactly once, and normalising twice re-wrapped the details object.
+        out.append(rec)
     return out or None
+
+
+def _detail_fields(values):
+    """Only the structured fields we actually managed to extract."""
+    fields = {}
+    for key, label in DETAIL_LABELS:
+        value = values.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            fields[label] = text
+    return fields
+
+
+def _build_details(raw_record, stringified):
+    """Build records.details as a flat object.
+
+    Idempotent: if details is already an object (the record was normalised
+    earlier in the pipeline) it is passed through unchanged.
+    """
+    existing = raw_record.get("details")
+    if isinstance(existing, dict):
+        carried = {}
+        for key, value in existing.items():
+            text = "" if value is None else str(value).strip()
+            if text:
+                carried[str(key)] = text
+        return carried or {"Summary": "No additional details extracted."}
+
+    details = {}
+    prose = stringified.get("details", "").strip()
+    if prose:
+        details["Summary"] = prose
+    details.update(_detail_fields(stringified))
+    if not details:
+        details["Summary"] = "No additional details extracted."
+    return details
 
 
 def _normalize_record(rec):
@@ -444,24 +516,14 @@ def _normalize_record(rec):
             out[str(k)] = "" if v is None else str(v)
     title = out.get("title", "").strip() or "Insurance Policy"
     due = _iso(out.get("due_date") or out.get("expiration_date") or "")
-    status = out.get("status", "").strip() or _synth_status(due)
-    details = out.get("details", "").strip()
-    if not details:
-        bits = []
-        for label, key in (("Insurer", "insurer"), ("Insured", "insured"),
-                           ("Policy #", "policy_number"),
-                           ("Coverage", "coverage_type"),
-                           ("Effective", "effective_date"),
-                           ("Expiration", "expiration_date"),
-                           ("Limits", "limits"), ("Premium", "premium")):
-            if out.get(key):
-                bits.append("%s: %s" % (label, out[key]))
-        details = "; ".join(bits) or "No additional details extracted."
+    status = _canonical_status(out.get("status"), due)
     out.update({
         "title": title,
         "status": status,
-        "details": details,
-        "due_date": due,
+        "details": _build_details(rec, out),
+        # None rather than "": the column is a date, and an empty string is not
+        # a valid date literal.
+        "due_date": due or None,
     })
     return out
 

@@ -29,10 +29,11 @@ export const severityToBadgeVariant: Record<Severity, 'destructive' | 'warning' 
   neutral: 'secondary',
 }
 
-// PRODUCT_CUSTOMIZE: replace this list with the real statuses this product
-// produces (must match exactly what the backend poller writes to
-// records.status). Every status must declare a severity tier above. Default
-// values below are generic placeholders only — do not ship as-is.
+// The statuses processor.py actually writes to records.status. Free-form model
+// output is clamped onto this set by _canonical_status(), so keep the two in
+// sync: the status filter options and the route's search enum are both built
+// from this list, and a status missing here renders as an uncoloured raw
+// string that no filter can match.
 // __STATUSES_BLOCK_START__
 export const statuses: {
   label: string
@@ -40,18 +41,12 @@ export const statuses: {
   icon: typeof TriangleAlert
   severity: Severity
 }[] = [
-  { label: 'Compliant', value: 'compliant:good', icon: CircleCheckBig, severity: 'good' as Severity },
-  { label: 'Missing', value: 'missing:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Expired', value: 'expired:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Expiring Soon', value: 'expiring_soon:warning', icon: Clock, severity: 'warning' as Severity },
-  { label: 'Below Required Limit', value: 'below_required_limit:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Additional Insured Missing', value: 'additional_insured_missing:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Primary Noncontributory Missing', value: 'primary_noncontributory_missing:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Waiver Subrogation Missing', value: 'waiver_subrogation_missing:warning', icon: Clock, severity: 'warning' as Severity },
-  { label: 'Notice Cancellation Missing', value: 'notice_cancellation_missing:warning', icon: Clock, severity: 'warning' as Severity },
-  { label: 'Sublimit Exclusion Gap', value: 'sublimit_exclusion_gap:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Manuscript Endorsement Needs Review', value: 'manuscript_endorsement_needs_review:warning', icon: Clock, severity: 'warning' as Severity },
-  { label: 'Policy Mismatch', value: 'policy_mismatch:critical', icon: TriangleAlert, severity: 'critical' as Severity },
-  { label: 'Unable Verify', value: 'unable_verify:warning', icon: Clock, severity: 'warning' as Severity },
+  { label: 'Valid', value: 'VALID', icon: CircleCheckBig, severity: 'good' as Severity },
+  { label: 'Active', value: 'ACTIVE', icon: CircleCheckBig, severity: 'good' as Severity },
+  { label: 'Expiring Soon', value: 'EXPIRING SOON', icon: Clock, severity: 'warning' as Severity },
+  { label: 'Pending', value: 'PENDING', icon: Clock, severity: 'neutral' as Severity },
+  { label: 'Pending Verification', value: 'PENDING VERIFICATION', icon: Clock, severity: 'warning' as Severity },
+  { label: 'Pending Renewal Quote', value: 'PENDING RENEWAL QUOTE', icon: Clock, severity: 'warning' as Severity },
+  { label: 'Expired', value: 'EXPIRED', icon: TriangleAlert, severity: 'critical' as Severity },
 ]
 // __STATUSES_BLOCK_END__

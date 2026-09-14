@@ -8,9 +8,14 @@ export const taskSchema = z.object({
   status: z.string(),
   label: z.string(),
   priority: z.string(),
-  // Structured extracted fields (e.g. expiration date, policy number,
-  // coverage type). Keys are product-specific — set by the backend poller.
-  details: z.record(z.string(), z.unknown()).nullable().optional(),
+  // records.details is jsonb and holds two shapes: the structured object the
+  // poller writes, and legacy free-form prose written by earlier processor
+  // versions. Accept both; tasks.ts normalises to an object at the fetch
+  // boundary so every consumer below it sees exactly one shape.
+  details: z
+    .union([z.record(z.string(), z.unknown()), z.string()])
+    .nullable()
+    .optional(),
   // Path in the 'uploads' bucket to the original document this record
   // came from, for verifying extraction against the source.
   source_file_path: z.string().nullable().optional(),
