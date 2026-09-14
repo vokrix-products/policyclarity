@@ -79,7 +79,10 @@ export const tasksColumns: ColumnDef<Task>[] = [
     },
     cell: ({ row }) => {
       return (
-        <div className='flex space-x-2'>
+        // min-w-0 is required: without it this flex item keeps the default
+        // min-width:auto, so the truncate span below can never shrink below
+        // its content width and long names overflow the cell.
+        <div className='flex min-w-0 items-center space-x-2'>
           <span className='truncate font-medium'>{row.getValue('title')}</span>
         </div>
       )
@@ -90,18 +93,32 @@ export const tasksColumns: ColumnDef<Task>[] = [
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title='Status' />
     ),
-    meta: { className: 'ps-1', tdClassName: 'ps-4' },
+    // Pin the column. Long free-form statuses (legacy rows that are not in the
+    // closed status set) would otherwise let the column grow without limit.
+    meta: { className: 'ps-1 w-40 max-w-40', tdClassName: 'ps-4' },
     cell: ({ row }) => {
       const statusValue = row.getValue('status') as string
       const statusDef = statuses.find((s) => s.value === statusValue)
       const severity = statusDef?.severity ?? 'neutral'
       const badgeVariant = severityToBadgeVariant[severity]
       const Icon = statusDef?.icon
+      const label = statusDef?.label ?? statusValue
       return (
-        <div className='flex w-32 items-center gap-2'>
-          <Badge variant={badgeVariant} className='flex items-center gap-1'>
-            {Icon && <Icon className='size-3' />}
-            {statusDef?.label ?? statusValue}
+        <div className='flex min-w-0 max-w-full items-center gap-2'>
+          {/*
+            Badge base classes are w-fit + shrink-0 (+ overflow-hidden), which
+            means it sizes to its own text and refuses to shrink inside this
+            flex parent - so the badge used to escape the cell and paint over
+            the next column. min-w-0/max-w-full/shrink override that, and the
+            label is truncated inside with the full value kept in title.
+          */}
+          <Badge
+            variant={badgeVariant}
+            className='min-w-0 max-w-full shrink items-center gap-1'
+            title={label}
+          >
+            {Icon && <Icon className='size-3 shrink-0' />}
+            <span className='min-w-0 truncate'>{label}</span>
           </Badge>
         </div>
       )
@@ -116,7 +133,7 @@ export const tasksColumns: ColumnDef<Task>[] = [
     header: ({ column }) => (
       <DataTableColumnHeader column={column} title='Due / Expires' />
     ),
-    meta: { className: 'ps-1', tdClassName: 'ps-4' },
+    meta: { className: 'ps-1 whitespace-nowrap', tdClassName: 'ps-4' },
     cell: ({ row }) => {
       const val = row.getValue('due_date') as string | null | undefined
       const formatted = formatDueDate(val)
